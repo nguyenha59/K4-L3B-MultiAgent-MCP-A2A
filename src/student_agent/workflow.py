@@ -10,6 +10,7 @@ from typing import Any
 
 from . import OUTPUT_SCHEMA_VERSION
 from .agents import (
+    Instance,
     Instances,
     classify,
     entity_agent,
@@ -18,11 +19,12 @@ from .agents import (
     order_agent,
     parse_ts,
     payment_agent,
+    payment_view,
     shipment_agent,
 )
 from .contracts import ContractError, Contracts
 from .mcp_gateway import EvidenceGateway
-from .state import TASK_TIMEOUT_S, CaseState, ResultMessage, TaskMessage
+from .state import TASK_TIMEOUT_S, CaseState, ResultMessage, TaskMessage, TransportFailure
 from .trace import TraceWriter
 
 Agent = Callable[[TaskMessage, Any, CaseState], Awaitable[ResultMessage]]
@@ -51,12 +53,9 @@ async def _dispatch(state: CaseState, agent: Agent, recipient: str, task: str,
     try:
         result = await asyncio.wait_for(agent(message, state.scoped(recipient), state),
                                         TASK_TIMEOUT_S)
-    except Exception as exc:  # transport failure or timeout: never invent a finding
-        result = ResultMessage(state.case_id, message.correlation_id, recipient, "failed", {},
-                               "TOOL_UNAVAILABLE")
-        state.emit("handoff", recipient, target="coordinator", decision_code="TOOL_UNAVAILABLE",
-                   attributes={"error": type(exc).__name__})
-        return result
+    except TimeoutError as exc:
+        # Never finalize a case on partial evidence: abort so the runner re-runs the case.
+        raise TransportFailure(f"{recipient} timed out") from exc
     if result.case_id != state.case_id or result.correlation_id != message.correlation_id:
         raise ValueError(f"{recipient} returned a result for another case/task")
     state.emit("handoff", recipient, target="coordinator", decision_code=result.decision_code,
@@ -79,8 +78,7 @@ async def solve_case(
         return _finalize(state, _insufficient_output(state, entity, rules))
 
     order_id = entity["order_id"]
-    state.findings["anchor"] = entity["anchor"]
-    instances = Instances(entity["rows"], entity["anchor"])
+    instances = Instances(entity["rows"])
 
     # 2. Order/product first (shipping limits and expected totals feed the next specialists).
     order_result, policy_result = await asyncio.gather(
@@ -88,40 +86,123 @@ async def solve_case(
                   {"order_id": order_id, "instances": instances}),
         policy_task,
     )
-    order = order_result.finding
-    expected = None
-    if order_result.status == "ok":
-        expected = round(order["price_total"] + order["freight_total"], 2)
+    orders = order_result.finding.get("by_instance") or {}
+    expected = {key: round(o["price_total"] + o["freight_total"], 2) if o["item_ids"] else None
+                for key, o in orders.items()}
 
-    # 3. Shipment and payment specialists in parallel.
-    shipment_result, payment_result = await asyncio.gather(
-        _dispatch(state, shipment_agent, "shipment-agent", "analyze_shipment",
-                  {"order_id": order_id, "instances": instances,
-                   "shipping_limits": order.get("shipping_limits", {})}),
-        _dispatch(state, payment_agent, "payment-agent", "analyze_payment",
-                  {"order_id": order_id, "instances": instances, "expected_total": expected}),
-    )
-    shipment, payment = shipment_result.finding, payment_result.finding
+    # 3. Shipment and payment specialists in parallel, fetching only what the claims need.
+    plan = _investigation_plan(case)
+    limits = {k: o["shipping_limits"] for k, o in orders.items()}
+
+    async def investigate(scope: frozenset[str], code: str) -> tuple[ResultMessage,
+                                                                     ResultMessage]:
+        return await asyncio.gather(
+            _dispatch(state, shipment_agent, "shipment-agent", code,
+                      {"order_id": order_id, "instances": instances, "shipping_limits": limits,
+                       "fetch_summary": "shipment" in scope}),
+            _dispatch(state, payment_agent, "payment-agent", code,
+                      {"order_id": order_id, "instances": instances,
+                       "fetch_refunds": "refund" in scope}),
+        )
+
+    shipment_result, payment_result = await investigate(plan, "analyze_claim_scope")
     rules = policy_result.finding.get("rules", {})
 
-    issues = classify((entity.get("anchor") or {}).get("order_status"), shipment, payment)
-    primary = issues[0] if issues else "unsupported_claim"
+    # 4. Coordinator decides which purchase instance the complaint is about; if no instance
+    #    confirms a claim, it escalates to a full investigation before deciding.
+    def decide_instance() -> dict[str, Any]:
+        return _choose_instance(
+            state, instances, orders, shipment_result.finding.get("by_instance") or {},
+            payment_result.finding.get("by_instance") or {}, expected,
+            bool(payment_result.finding.get("has_timeline")))
 
-    # 4. Dynamic follow-up: seller evidence only when a seller is held responsible.
+    choice = decide_instance()
+    if not choice["matched_claim"] and plan != FULL_SCOPE:
+        shipment_result, payment_result = await investigate(FULL_SCOPE, "escalate_full_scope")
+        choice = decide_instance()
+    shipments = shipment_result.finding.get("by_instance") or {}
+    payments = payment_result.finding.get("by_instance") or {}
+    has_timeline = bool(payment_result.finding.get("has_timeline"))
+    inst, primary = choice["instance"], choice["primary"]
+    state.findings["anchor"] = inst.row
+    order = orders.get(inst.key) or {"item_ids": [], "seller_ids": [], "freight_total": 0.0}
+    shipment = shipments.get(inst.key) or {"verdict": "insufficient_evidence"}
+    payment = payment_view(payments.get(inst.key) or {}, expected.get(inst.key), has_timeline,
+                           primary)
+    issues = [primary, *[i for i in choice["issues"]
+                         if i != primary and i != "valid_split_payment"]]
+    if inst.copies > 1:
+        issues = issues[:1]  # identical instances: other flows cannot be attributed safely
+
+    # 5. Dynamic follow-up: seller evidence only when a seller is held responsible.
     if primary in SELLER_ISSUES and order.get("seller_ids"):
         await _dispatch(state, order_agent, "order-agent", "fetch_sellers",
                         {"order_id": order_id, "instances": instances})
 
-    conflicts = _resolve_conflicts(state, entity, shipment)
-    draft = _decide(state, entity, order, shipment, payment, rules, issues, conflicts)
+    conflicts = _resolve_conflicts(state, entity, inst, shipment, shipment_result.finding)
+    draft = _decide(state, entity, order, shipment, payment, rules, issues, conflicts,
+                    inst.copies > 1, choice["matched_claim"])
     return _finalize(state, draft)
 
 
+FULL_SCOPE = frozenset({"shipment", "refund"})
+# Extra evidence each claimed issue needs beyond the always-fetched core
+# (history, order, items, product, policy, payment timeline).
+CLAIM_SCOPE: dict[str, frozenset[str]] = {
+    "late_delivery_seller": frozenset({"shipment"}),
+    "late_delivery_logistics": frozenset({"shipment"}),
+    "refund_pending": frozenset({"refund"}),
+    "refund_failed": frozenset({"refund"}),
+    "unsupported_claim": FULL_SCOPE,
+    "canceled_order_paid": frozenset(),
+    "unavailable_order_paid": frozenset(),
+    "valid_split_payment": frozenset(),
+    "duplicate_charge": frozenset(),
+    "payment_mismatch": frozenset(),
+}
+
+
+def _investigation_plan(case: dict[str, Any]) -> frozenset[str]:
+    topics = [c.get("topic") for c in (case.get("customer_request") or {}).get("claims") or []]
+    issue_topics = [t for t in topics if t != "requested_full_refund"]
+    if not issue_topics or any(t not in CLAIM_SCOPE for t in issue_topics):
+        return FULL_SCOPE
+    return frozenset().union(*(CLAIM_SCOPE[t] for t in issue_topics))
+
+
+def _choose_instance(state: CaseState, instances: Instances, orders: dict[str, Any],
+                     shipments: dict[str, Any], payments: dict[str, Any],
+                     expected: dict[str, float | None], has_timeline: bool) -> dict[str, Any]:
+    """Evidence per instance → issues; prefer an eligible instance that evidences a claim."""
+    opened_at = parse_ts(state.case.get("opened_at"))
+    eligible = [i for i in instances.items
+                if i.start is None or opened_at is None or i.start <= opened_at]
+    eligible = eligible or instances.items
+    per: dict[str, list[str]] = {}
+    for inst in eligible:
+        view = payment_view(payments.get(inst.key) or {}, expected.get(inst.key), has_timeline)
+        per[inst.key] = classify(inst.row.get("order_status"),
+                                 shipments.get(inst.key) or {}, view)
+    topics = [c.get("topic") for c in (state.case.get("customer_request") or {}).get("claims")
+              or []]
+    for inst in reversed(eligible):  # latest matching instance first
+        for topic in topics:
+            if topic in per[inst.key]:
+                return {"instance": inst, "primary": topic, "issues": per[inst.key],
+                        "matched_claim": True}
+    inst = eligible[-1]
+    issues = per[inst.key]
+    real = [i for i in issues if i != "valid_split_payment"]
+    primary = real[0] if real else (issues[0] if issues else "unsupported_claim")
+    return {"instance": inst, "primary": primary, "issues": issues, "matched_claim": False}
+
+
 # --------------------------------------------------------------------------- conflicts
-def _resolve_conflicts(state: CaseState, entity: dict[str, Any],
-                       shipment: dict[str, Any]) -> list[dict[str, Any]]:
+def _resolve_conflicts(state: CaseState, entity: dict[str, Any], inst: Instance,
+                       shipment: dict[str, Any],
+                       summary: dict[str, Any]) -> list[dict[str, Any]]:
     conflicts: list[dict[str, Any]] = []
-    anchor, order_row = entity.get("anchor") or {}, entity.get("order_row") or {}
+    anchor, order_row = inst.row, entity.get("order_row") or {}
     if order_row and anchor and (
         order_row.get("order_purchase_timestamp") != anchor.get("order_purchase_timestamp")
     ):
@@ -131,10 +212,19 @@ def _resolve_conflicts(state: CaseState, entity: dict[str, Any],
             "selected_source": "get_customer_history",
             "resolution_code": "ANCHORED_TO_CASE_OPENED_AT",
         })
-    if shipment.get("summary_instance_mismatch"):
+    # The shipment summary (or, when it was not needed, the order row) describes one instance;
+    # a delivery date that differs from the selected instance is a source conflict.
+    other_source, other_delivered = (
+        ("get_shipment_summary", summary.get("summary_delivered_at"))
+        if summary.get("has_summary")
+        else ("get_order", order_row.get("order_delivered_customer_date") if order_row else None)
+    )
+    if (summary.get("has_summary") or order_row) and parse_ts(other_delivered) != parse_ts(
+        anchor.get("order_delivered_customer_date")
+    ):
         conflicts.append({
             "field": "delivered_customer_at",
-            "sources": ["get_shipment_summary", "get_customer_history"],
+            "sources": [other_source, "get_customer_history"],
             "selected_source": "get_customer_history",
             "resolution_code": "ANCHORED_TO_CASE_OPENED_AT",
         })
@@ -151,7 +241,8 @@ def _resolve_conflicts(state: CaseState, entity: dict[str, Any],
 # --------------------------------------------------------------------------- policy
 def _decide(state: CaseState, entity: dict[str, Any], order: dict[str, Any],
             shipment: dict[str, Any], payment: dict[str, Any], rules: dict[str, Any],
-            issues: list[str], conflicts: list[dict[str, Any]]) -> dict[str, Any]:
+            issues: list[str], conflicts: list[dict[str, Any]], merged: bool,
+            matched_claim: bool) -> dict[str, Any]:
     order_id = entity["order_id"]
     primary = issues[0] if issues else "unsupported_claim"
     secondary = issues[1:]
@@ -257,8 +348,13 @@ def _decide(state: CaseState, entity: dict[str, Any], order: dict[str, Any],
         },
         "resolution_actions": [action],
     }
-    output["assessment"]["confidence"] = _confidence(entity, shipment, payment, primary,
-                                                     conflicts, bool(issues))
+    confidence = _confidence(entity, shipment, payment, primary, conflicts,
+                             primary != "unsupported_claim")
+    if merged:
+        confidence -= 0.1  # identical instances: flows attributed by scenario, not by time
+    if not matched_claim and primary != "unsupported_claim":
+        confidence -= 0.1  # evidence contradicts every customer claim
+    output["assessment"]["confidence"] = round(min(0.95, max(0.3, confidence)), 2)
     return output
 
 

@@ -26,6 +26,10 @@ class ToolFailure(RuntimeError):
     """The MCP tool answered with an error (e.g. no records); never retried."""
 
 
+class TransportFailure(ConnectionError):
+    """The MCP connection failed; the whole case must be re-run, never finalized degraded."""
+
+
 @dataclass(frozen=True)
 class TaskMessage:
     case_id: str
@@ -128,9 +132,9 @@ class CaseState:
                 failure = ToolFailure(str(exc))
                 self._cache[key] = failure
                 raise failure from exc
-            except Exception:
+            except Exception as exc:
                 if attempt + 1 == attempts:
-                    raise
+                    raise TransportFailure(f"{tool}: {type(exc).__name__}") from exc
                 async with self._lock:
                     self.calls += 1
         self._cache[key] = evidence

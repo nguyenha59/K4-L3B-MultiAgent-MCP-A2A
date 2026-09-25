@@ -76,15 +76,20 @@ nhận khi xuất hiện trong `get_customer_history` của `customer_unique_id_
 trong history thì bị đưa vào `rejected_candidates` **mà không gọi thêm tool** (tiết kiệm call);
 chỉ khi không candidate nào có trong history mới thử `get_order` từng candidate.
 
-**Instance:** evidence của một `order_id` có thể chứa nhiều bản ghi (order row, item row,
-payment event…) thuộc các lần mua khác nhau. Entity agent chọn **anchor** = bản ghi history có
-`order_purchase_timestamp` muộn nhất nhưng ≤ `opened_at`. Nếu không có bản ghi nào trước
-`opened_at` → chọn bản ghi gần `opened_at` nhất và hạ confidence. Các specialist lọc dữ liệu
-theo anchor:
+**Instance:** evidence của một `order_id` có thể chứa nhiều lần mua (history row) trộn lẫn;
+history row trùng hệt nhau được gộp thành một instance. Specialist gán từng record vào instance
+bằng **offset so với purchase** (không theo khoảng thời gian, vì flow của các instance đan xen):
 
-- item: `shipping_limit_date` nằm trong cửa sổ [purchase, purchase + 10 ngày];
-- payment/refund/shipment event: `event_at` trong cửa sổ [purchase, mốc purchase của instance kế tiếp);
-- nếu không lọc được duy nhất → finding `insufficient`, không suy đoán.
+- payment event: purchase + [0, 12h]; refund event: purchase + [240h, 288h];
+- shipping limit / item: purchase + [48h, 96h]; shipment event: trùng ngày giao của instance;
+- không khớp duy nhất → instance mua gần nhất trước record (fallback thời gian).
+- event trùng hệt nhau (mọi field) bị loại trùng.
+
+Specialist trả finding **theo từng instance**. Coordinator xét các instance mua ≤ `opened_at`,
+tính issue của mỗi instance từ evidence, rồi chọn instance mới nhất **có evidence xác nhận một
+claim**; nếu không instance nào xác nhận → instance mới nhất và issue theo evidence (claim bị bác
+bỏ, confidence giảm). Khi chấm payment theo issue đã chọn, capture thuộc flow refund được tách
+khỏi flow split/capture để không cộng lẫn hai kịch bản.
 
 **Status:** `resolved` (1 order, anchor rõ), `ambiguous` (≥ 2 order hợp lệ hoặc anchor không
 xác định), `not_found` (không candidate nào tồn tại). `ambiguous`/`not_found` → Coordinator
@@ -123,7 +128,7 @@ neo theo `opened_at` > order row tổng hợp. Không phân xử được → `s
 
 | Failure | Retry budget | Fallback | Trace event/code |
 | --- | ---: | --- | --- |
-| MCP timeout / lỗi mạng | 1 (idempotent read) | finding `failed` → verdict `insufficient_evidence` | `handoff` decision_code `TOOL_UNAVAILABLE` |
+| MCP timeout / lỗi mạng | 1 retry/call; 5 lần reconnect liên tiếp (5–60 s backoff) | hủy case (không ghi output thiếu dữ liệu), cắt trace của case dở, reconnect, chạy lại đúng case đó | stderr `WARN: MCP connection lost`; trace không chứa event của lần hỏng |
 | Tool trả lỗi nghiệp vụ (vd. không có refund) | 0 | coi là "không có dữ liệu", không đoán | `tool_result_consumed` không có ref / `handoff` `NO_RECORDS` |
 | Entity not found/ambiguous | 0 | dừng specialist, `needs_investigation` | `handoff` `ENTITY_NOT_FOUND` / `ENTITY_AMBIGUOUS` |
 | Source conflict | 0 | precedence §4, không được thì `UNRESOLVED` | `policy_decided` + `data_conflicts` |

@@ -40,24 +40,78 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    remaining = list(case_set.case_ids)
+    failures = 0
+    while remaining:
+        case_mark: int | None = None  # trace size before the in-flight case
+        try:
+            async with connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            ) as gateway:
+                discovered_tools = await gateway.list_tools()
+                if not discovered_tools:
+                    raise RuntimeError("MCP Gateway returned no tools")
+                while remaining:
+                    case_id = remaining[0]
+                    case = case_set.cases[case_id]
+                    case_mark = _trace_size(trace_path)
+                    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                    output = await solve_case(case, gateway, trace)
+                    contracts.validate_output(output, f"outputs/{case_id}.json")
+                    if output.get("case_id") != case_id:
+                        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                    target = output_root / f"{case_id}.json"
+                    temporary = target.with_suffix(".json.tmp")
+                    temporary.write_text(
+                        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                    )
+                    temporary.replace(target)
+                    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                    case_mark = None
+                    remaining.pop(0)
+                    failures = 0
+        except BaseException as exc:
+            if not _is_transient(exc):
+                raise
+            if case_mark is not None:
+                _truncate_trace(trace_path, case_mark)  # drop the interrupted case's events
+            if not remaining:
+                break  # connection dropped while closing after the last case
+            failures += 1
+            if failures > MAX_RECONNECTS:
+                raise RuntimeError(
+                    f"MCP connection failed {failures} times in a row at {remaining[0]}"
+                ) from exc
+            delay = RECONNECT_DELAYS_S[min(failures, len(RECONNECT_DELAYS_S)) - 1]
+            print(
+                f"WARN: MCP connection lost at {remaining[0]} ({type(exc).__name__}); "
+                f"reconnect {failures}/{MAX_RECONNECTS} in {delay}s",
+                file=sys.stderr,
             )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            await asyncio.sleep(delay)
+
+
+MAX_RECONNECTS = 5
+RECONNECT_DELAYS_S = (5, 10, 20, 30, 60)
+_NON_TRANSIENT = (ValueError, TypeError, KeyError, AttributeError, PermissionError,
+                  NotImplementedError, KeyboardInterrupt, SystemExit, asyncio.CancelledError)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Network/transport failures (possibly wrapped in exception groups) are retryable."""
+    if isinstance(exc, BaseExceptionGroup):
+        return all(_is_transient(inner) for inner in exc.exceptions)
+    return isinstance(exc, Exception) and not isinstance(exc, _NON_TRANSIENT)
+
+
+def _trace_size(path: Path) -> int:
+    return path.stat().st_size if path.exists() else 0
+
+
+def _truncate_trace(path: Path, size: int) -> None:
+    if path.exists():
+        with path.open("r+b") as handle:
+            handle.truncate(size)
 
 
 def parser() -> argparse.ArgumentParser:
