@@ -362,8 +362,8 @@ def _output_refs(state: CaseState, primary: str) -> list[str]:
     tools = ["get_customer_history", "get_order", "get_order_items", "get_product_context"]
     if primary in SHIPMENT_ISSUES or primary == "unsupported_claim":
         tools.append("get_shipment_summary")
-    if primary in PAYMENT_ISSUES or primary in REFUND_ISSUES or primary == "unsupported_claim":
-        tools.append("get_payment_timeline")
+    # Payment evidence backs payment_analysis and every refund amount, so it is always cited.
+    tools.append("get_payment_timeline")
     if primary in REFUND_ISSUES:
         tools.append("get_refund_timeline")
     if primary in SELLER_ISSUES:
