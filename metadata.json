@@ -1,0 +1,18 @@
+{
+  "team": "K4-TeamXX-Rapunzel",
+  "variant": "l3b",
+  "llm_used": false,
+  "models": [],
+  "model_note": "Rule-based deterministic multi-agent workflow; no LLM or ML model is used (0 parameters, compliant with the <=10B rule).",
+  "framework": "Python asyncio (no agent framework)",
+  "agents": [
+    "coordinator",
+    "entity-agent",
+    "order-agent",
+    "shipment-agent",
+    "payment-agent",
+    "conflict-resolver",
+    "policy-agent",
+    "verifier"
+  ]
+}
